@@ -1,0 +1,7 @@
+streamlit
+numpy
+matplotlib
+scipy
+SimpleITK
+scikit-learn
+pydicom
