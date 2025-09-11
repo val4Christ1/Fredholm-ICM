@@ -2,9 +2,6 @@ streamlit
 numpy
 matplotlib
 scipy
-<<<<<<< HEAD
-=======
 SimpleITK
 scikit-learn
 pydicom
->>>>>>> 80a68e324a4b0d453327bda096aaa49f35a01d20
