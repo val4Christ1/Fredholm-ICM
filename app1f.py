@@ -378,6 +378,8 @@ else:
             try:
                 with zipfile.ZipFile(zipf, 'r') as z:
                     z.extractall(tmpdir)
+                # Set permissions to ensure SimpleITK can read the extracted files
+                os.chmod(tmpdir, 0o755)
                 st.sidebar.info(f'Extracted zip into temporary folder: {tmpdir}')
                 dicom_dir = tmpdir
             except Exception as e:
