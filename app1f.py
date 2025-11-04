@@ -1,26 +1,97 @@
 #!/usr/bin/env python3
-"""streamlit_dicom_fredholm_app_final.py
+"""
+streamlit_dicom_fredholm_app_complete.py
 
-Streamlit app for Fredholm inversion from DICOM series.
-Displays range (min/max) of generated T1 and T2 grids after inversion.
+Complete, corrected Streamlit app for Fredholm inversion of MRI DICOM series.
+Includes decorative images (robust), DICOM reading, time extraction, T1/T2 auto-grid,
+kernel construction, solvers (FISTA/lsq/nnls), diagnostics, CSV/NPZ export, and plots.
 """
 
-import os, time, tempfile, shutil
+import os
+import time
+import tempfile
+import shutil
 import streamlit as st
 import numpy as np
 import SimpleITK as sitk
-from scipy.optimize import lsq_linear, nnls
+from scipy.optimize import lsq_linear, nnls, curve_fit
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from scipy import stats
+
+# matplotlib figure backend imports for placeholder generation
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+# reduce matplotlib noise
+import logging
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 try:
     import pydicom
 except Exception:
     pydicom = None
 
-st.set_page_config(layout="wide", page_title="Fredholm MRI DICOM Inversion App")
+st.set_page_config(layout="wide", page_title="Fredholm MRI DICOM Inversion — Brain")
 
+# ------------------ Decorative images ------------------
+# Remote image URLs (Unsplash). If remote fetch fails we generate placeholders.
+#DECOR_IMAGES = [
+    #"https://images.unsplash.com/photo-1526256262350-7da7584cf5eb?auto=format&fit=crop&w=1200&q=80",
+    #"https://images.unsplash.com/photo-1582719478250-5f3b0f28d560?auto=format&fit=crop&w=1200&q=80",
+    #"https://images.unsplash.com/photo-1582719478638-7b3b0b1e7b54?auto=format&fit=crop&w=1200&q=80"
+#]
+
+# Optional: local decorative images (set to None to not use local images)
+LOCAL_DECOR_PATHS = ["./assets/1.png", "./assets/2.png", "./assets/image.jpg"]
+
+def make_placeholder_image(text, w=800, h=400, bg=(40,44,52), fg=(220,220,220)):
+    """Return an (H,W,3) uint8 RGB placeholder generated with matplotlib Figure."""
+    fig = Figure(figsize=(w/100, h/100), dpi=100)
+    canvas = FigureCanvas(fig)
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(np.array(bg)/255.0)
+    ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=20, color=np.array(fg)/255.0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.tight_layout(pad=0)
+    canvas.draw()
+    buf = canvas.buffer_rgba()
+    arr = np.asarray(buf)
+    # arr shape (H, W, 4) RGBA — convert to RGB
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        rgb = arr[:, :, :3].copy()
+    else:
+        rgb = np.ones((h, w, 3), dtype=np.uint8) * int(bg[0])
+    return rgb
+
+def show_decorations(sidebar=True):
+    """Display banner and thumbnails robustly: local -> remote -> placeholder."""
+    # banner
+    try:
+        if LOCAL_DECOR_PATHS and os.path.exists(LOCAL_DECOR_PATHS[0]):
+            st.image(LOCAL_DECOR_PATHS[0], caption="MRI scanner — demo", use_container_width=True)
+        else:
+            st.image(DECOR_IMAGES[0], caption="MRI scanner — demo", use_container_width=True)
+    except Exception:
+        ph = make_placeholder_image("MRI scanner — decorative banner")
+        st.image(ph, caption="MRI scanner — demo", use_container_width=True)
+
+    # sidebar thumbnails
+    if sidebar:
+        st.sidebar.markdown("### Visuals")
+        labels = ["MRI scanner", "Colorful MRI", "Patient in MRI"]
+        for i, lab in enumerate(labels):
+            try:
+                if LOCAL_DECOR_PATHS and i < len(LOCAL_DECOR_PATHS) and os.path.exists(LOCAL_DECOR_PATHS[i]):
+                    st.sidebar.image(LOCAL_DECOR_PATHS[i], width=200)
+                else:
+                    st.sidebar.image(DECOR_IMAGES[i], width=200)
+            except Exception:
+                ph = make_placeholder_image(lab, w=320, h=180)
+                st.sidebar.image(ph, width=200)
+
+# ----------------- DICOM reading helpers -----------------
 
 def read_dicom_series_robust(directory, choose_largest_series=True, pad_mode='constant', pad_value=0):
     files_all = [os.path.join(directory, f) for f in sorted(os.listdir(directory))]
@@ -136,7 +207,6 @@ def read_dicom_series_robust(directory, choose_largest_series=True, pad_mode='co
 
     return padded, file_list, best_uid
 
-
 def read_echo_times_from_files(file_paths):
     times = []
     for p in file_paths:
@@ -174,12 +244,14 @@ def read_echo_times_from_files(file_paths):
         if et is None:
             times.append(None)
         else:
-            # Convert to seconds if value is large (likely in ms)
-            times.append(et/1000.0 if et > 1.0 else et)
+            try:
+                etf = float(et)
+                times.append(etf/1000.0 if etf > 1.0 else etf)
+            except Exception:
+                times.append(None)
     if all(t is None for t in times):
         return None
     return np.array([np.nan if t is None else float(t) for t in times])
-
 
 def compute_timeseries_from_volume_list(volumes_list, mask=None):
     S = []
@@ -205,34 +277,116 @@ def compute_timeseries_from_volume_list(volumes_list, mask=None):
                 S.append(arr.mean())
     return np.array(S, dtype=float)
 
+# ----------------- Small estimation helpers -----------------
+def _aic(n, rss, k):
+    if rss <= 0:
+        rss = 1e-12
+    return 2.0 * k + n * np.log(rss / n)
+
+def estimate_T2_multi_start(S, tvals):
+    S = np.asarray(S, dtype=float)
+    t = np.asarray(tvals, dtype=float)
+    if S.size < 3:
+        return None, None
+    initials = [0.03, 0.06, 0.08, 0.12, 0.2, 0.5]
+    best = None
+    best_aic = np.inf
+    n = S.size
+    for T0 in initials:
+        try:
+            p0 = [max(S[0] - S[-1], 1e-6), max(T0, 1e-4), np.min(S)]
+            def fun(t, A, T, C):
+                return A * np.exp(-t / T) + C
+            popt, pcov = curve_fit(fun, t, S, p0=p0, bounds=([0, 1e-4, -np.inf], [np.inf, 10.0, np.inf]), maxfev=20000)
+            residuals = S - fun(t, *popt)
+            rss = float(np.sum(residuals**2))
+            aic = _aic(n, rss, k=3)
+            if aic < best_aic:
+                best_aic = aic
+                best = (abs(float(popt[1])), {'model': 'monoexp', 'popt': popt, 'rss': rss, 'aic': aic})
+        except Exception:
+            continue
+    if best is None:
+        try:
+            mask = S > 0
+            if np.sum(mask) >= 3:
+                y = np.log(S[mask])
+                x = t[mask]
+                A = np.vstack([x, np.ones_like(x)]).T
+                m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+                T_est = -1.0 / m if m != 0 else None
+                if T_est is not None and T_est > 0:
+                    return float(T_est), {'model': 'log-linear'}
+        except Exception:
+            pass
+        return None, None
+    return best
+
+def estimate_T1_multi_start(S, tvals):
+    S = np.asarray(S, dtype=float)
+    t = np.asarray(tvals, dtype=float)
+    if S.size < 3:
+        return None, None
+
+    model_candidates = []
+    n = S.size
+
+    # saturation recovery
+    for T0 in [0.2, 0.5, 1.0, 1.5]:
+        try:
+            def fun_sat(t, A, T, C):
+                return A * (1.0 - np.exp(-t / T)) + C
+            p0 = [np.max(S) - np.min(S), max(T0, 1e-4), np.min(S)]
+            popt, pcov = curve_fit(fun_sat, t, S, p0=p0, bounds=([-np.inf, 1e-4, -np.inf], [np.inf, 30.0, np.inf]), maxfev=20000)
+            residuals = S - fun_sat(t, *popt)
+            rss = float(np.sum(residuals**2))
+            aic = _aic(n, rss, k=3)
+            model_candidates.append((abs(float(popt[1])), {'model': 'sat', 'popt': popt, 'rss': rss, 'aic': aic}))
+        except Exception:
+            pass
+
+    # inversion recovery
+    for T0 in [0.2, 0.5, 1.0, 1.5]:
+        try:
+            def fun_ir(t, A, T, C):
+                return A * (1.0 - 2.0 * np.exp(-t / T)) + C
+            p0 = [np.max(S) - np.min(S), max(T0, 1e-4), np.min(S)]
+            popt, pcov = curve_fit(fun_ir, t, S, p0=p0, bounds=([-np.inf, 1e-4, -np.inf], [np.inf, 30.0, np.inf]), maxfev=20000)
+            residuals = S - fun_ir(t, *popt)
+            rss = float(np.sum(residuals**2))
+            aic = _aic(n, rss, k=3)
+            model_candidates.append((abs(float(popt[1])), {'model': 'ir', 'popt': popt, 'rss': rss, 'aic': aic}))
+        except Exception:
+            pass
+
+    if len(model_candidates) == 0:
+        return None, None
+
+    best = min(model_candidates, key=lambda it: it[1].get('aic', np.inf))
+    return best
+
+# ----------------- Kernel, solver, metrics -----------------
 
 def build_T1_T2_grid(T1_min=0.05, T1_max=5.0, nT1=60, T2_min=0.01, T2_max=1.0, nT2=60):
-    T1_values = np.logspace(np.log10(T1_min), np.log10(T1_max), nT1)
-    T2_values = np.logspace(np.log10(T2_min), np.log10(T2_max), nT2)
+    T1_values = np.logspace(np.log10(max(1e-4, T1_min)), np.log10(max(T1_min * 1.0001, T1_max)), nT1)
+    T2_values = np.logspace(np.log10(max(1e-5, T2_min)), np.log10(max(T2_min * 1.0001, T2_max)), nT2)
     return T1_values, T2_values
-
 
 def build_kernel_matrix(t_samples, T1_values, T2_values, model_type='T1-T2'):
     t = np.asarray(t_samples).reshape(-1)
     T1g, T2g = np.meshgrid(T1_values, T2_values, indexing='xy')
     T1_flat = T1g.ravel()
     T2_flat = T2g.ravel()
-    
     if model_type == 'T1-T2':
-        # Standard T1-T2 model: S(t) = ∫∫ f(T1,T2) * exp(-t*(1/T1 + 1/T2)) dT1 dT2
         inv_sum = (1.0 / T1_flat) + (1.0 / T2_flat)
         K = np.exp(-np.outer(t, inv_sum))
     elif model_type == 'T2-only':
-        # T2-only model: S(t) = ∫ f(T2) * exp(-t/T2) dT2
         K = np.exp(-np.outer(t, 1.0 / T2_flat))
     elif model_type == 'T1-only':
-        # T1-only model: S(t) = ∫ f(T1) * (1 - exp(-t/T1)) dT1
         K = 1 - np.exp(-np.outer(t, 1.0 / T1_flat))
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-    
     return K, (T1_flat, T2_flat)
-
 
 def fista_nonneg(K, S, lam=1e-3, max_iters=2000, tol=1e-6, L=None, callback=None, verbose=False):
     m, n = K.shape
@@ -280,7 +434,6 @@ def fista_nonneg(K, S, lam=1e-3, max_iters=2000, tol=1e-6, L=None, callback=None
     info = {'iterations': k, 'L': L, 'elapsed_s': elapsed, 'converged': (rel_change < tol)}
     return x_k, info
 
-
 def prepare_csv_bytes(T1_vals, T2_vals, f_recovered, S, tvals):
     nT2, nT1 = f_recovered.shape
     T1_grid, T2_grid = np.meshgrid(T1_vals, T2_vals, indexing='xy')
@@ -296,45 +449,31 @@ def prepare_csv_bytes(T1_vals, T2_vals, f_recovered, S, tvals):
     csv_text = '\n'.join(rows)
     return csv_text.encode('utf-8')
 
-
 def prepare_st_series_csv_bytes(tvals, S):
     header = 'time_s,S\n'
     lines = [header]
     for t, s in zip(tvals, S):
-        lines.append(f"{t:.12g},{s:.12g}\\n")
+        lines.append(f"{t:.12g},{s:.12g}\n")
     txt = ''.join(lines)
     return txt.encode('utf-8')
 
-
 def calculate_performance_metrics(S, S_pred, tvals, x_hat, inversion_time):
-    """Calculate comprehensive performance metrics"""
     mse = mean_squared_error(S, S_pred)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(S, S_pred)
     r2 = r2_score(S, S_pred)
-    
-    # Normalized RMSE (by range of S)
     s_range = np.max(S) - np.min(S)
     nrmse_range = rmse / s_range if s_range > 0 else 0
-    
-    # Normalized RMSE (by mean of S)
     s_mean = np.mean(S)
     nrmse_mean = rmse / s_mean if s_mean > 0 else 0
-    
-    # Calculate signal-to-noise ratio (SNR) of residuals
     residuals = S - S_pred
     residual_std = np.std(residuals)
     signal_std = np.std(S)
     snr = 20 * np.log10(signal_std / residual_std) if residual_std > 0 else float('inf')
-    
-    # Calculate condition number of the solution
     solution_norm = np.linalg.norm(x_hat) if np.linalg.norm(x_hat) > 0 else 1
     residual_norm = np.linalg.norm(residuals)
     condition_ratio = residual_norm / solution_norm
-    
-    # Calculate explained variance
     explained_variance = max(0, 1 - np.var(residuals) / np.var(S))
-    
     return {
         'mse': mse,
         'rmse': rmse,
@@ -352,11 +491,20 @@ def calculate_performance_metrics(S, S_pred, tvals, x_hat, inversion_time):
         'signal_std': signal_std
     }
 
+# ----------------- UI controls -----------------
 
-st.title('Fredholm Inversion from Clinical Magnetic Resonance Imaging (MRI) DICOM Series')
+st.title('Fredholm Inversion — Brain MRI Relaxometry Mapping for DICOM Series')
 
 st.sidebar.header('Input selection and options')
 input_mode = st.sidebar.radio('Select input mode:', ['Local folder (path)', 'Upload files (ZIP or DICOMs)'])
+
+# show decorations?
+show_images = st.sidebar.checkbox("Show decorative MRI photos", value=True)
+if show_images:
+    try:
+        show_decorations(sidebar=True)
+    except Exception:
+        pass
 
 dicom_dir = None
 tmpdir = None
@@ -364,7 +512,7 @@ tmpdir = None
 if input_mode == 'Local folder (path)':
     dicom_dir = st.sidebar.text_input('Enter local folder path containing DICOM files', value='')
     if dicom_dir and not os.path.isdir(dicom_dir):
-        st.sidebar.error('Folder does not exist or is not accessible from server. Make sure Streamlit is running locally.')
+        st.sidebar.error('Folder does not exist or is not accessible from server.')
 else:
     uploaded = st.sidebar.file_uploader('Upload DICOM files (select multiple) or a ZIP of DICOMs', accept_multiple_files=True, type=None)
     if uploaded:
@@ -378,7 +526,6 @@ else:
             try:
                 with zipfile.ZipFile(zipf, 'r') as z:
                     z.extractall(tmpdir)
-                # Set permissions to ensure SimpleITK can read the extracted files
                 os.chmod(tmpdir, 0o755)
                 st.sidebar.info(f'Extracted zip into temporary folder: {tmpdir}')
                 dicom_dir = tmpdir
@@ -394,20 +541,26 @@ else:
 st.sidebar.header('Solver & grid settings')
 model_type = st.sidebar.selectbox('Relaxometry Model', ['T1-T2', 'T2-only', 'T1-only'])
 solver = st.sidebar.selectbox('Solver', ['fista', 'lsq', 'nnls'])
-nT1 = st.sidebar.number_input('nT1 (T1 bins)', min_value=10, max_value=500, value=60, step=10)
-nT2 = st.sidebar.number_input('nT2 (T2 bins)', min_value=10, max_value=500, value=60, step=10)
-T1_min = st.sidebar.number_input('T1 min (s)', min_value=0.001, value=0.05, format='%f')
-T1_max = st.sidebar.number_input('T1 max (s)', min_value=0.01, value=5.0, format='%f')
-T2_min = st.sidebar.number_input('T2 min (s)', min_value=0.001, value=0.01, format='%f')
-T2_max = st.sidebar.number_input('T2 max (s)', min_value=0.001, value=1.0, format='%f')
-lam = st.sidebar.number_input('Regularization lambda (FISTA)', min_value=0.0, value=1e-4, format='%g')
-max_iters = st.sidebar.number_input('Max iterations', min_value=10, value=2000, step=10)
-tol = st.sidebar.number_input('Tolerance (relative change)', min_value=1e-12, value=1e-6, format='%g')
+nT1 = int(st.sidebar.number_input('nT1 (T1 bins)', min_value=10, max_value=500, value=60, step=10))
+nT2 = int(st.sidebar.number_input('nT2 (T2 bins)', min_value=10, max_value=500, value=60, step=10))
+
+auto_grid = st.sidebar.checkbox('Auto-extract T1/T2 ranges from DICOM & S(t)', value=True)
+if not auto_grid:
+    T1_min = st.sidebar.number_input('T1 min (s)', min_value=0.001, value=0.05, format='%f')
+    T1_max = st.sidebar.number_input('T1 max (s)', min_value=0.01, value=5.0, format='%f')
+    T2_min = st.sidebar.number_input('T2 min (s)', min_value=0.001, value=0.01, format='%f')
+    T2_max = st.sidebar.number_input('T2 max (s)', min_value=0.001, value=1.0, format='%f')
+else:
+    T1_min = T1_max = T2_min = T2_max = None
+
+lam = st.sidebar.number_input('Regularization lambda (relative for FISTA)', min_value=0.0, value=1e-4, format='%g')
+max_iters = int(st.sidebar.number_input('Max iterations', min_value=10, value=2000, step=10))
+tol = float(st.sidebar.number_input('Tolerance (relative change)', min_value=1e-12, value=1e-6, format='%g'))
 
 st.sidebar.header('Signal Preprocessing')
-normalize_signal = st.sidebar.checkbox('Normalize signal to [0,1]', value=True)
+normalize_signal = st.sidebar.checkbox('Normalize signal to [0,1] (recommended)', value=True)
 smooth_signal = st.sidebar.checkbox('Apply signal smoothing', value=False)
-smooth_window = st.sidebar.slider('Smoothing window size', min_value=3, max_value=15, value=5, step=2)
+smooth_window = int(st.sidebar.slider('Smoothing window size', min_value=3, max_value=15, value=5, step=2))
 
 st.sidebar.header('Mask (optional)')
 mask_path = st.sidebar.text_input('Local mask file path (.nii/.nii.gz) (leave blank to use full image)')
@@ -420,6 +573,7 @@ if dicom_dir:
 else:
     st.write('No input selected yet.')
 
+# session state keys
 if 'csv_grid_bytes' not in st.session_state:
     st.session_state['csv_grid_bytes'] = None
 if 'csv_st_bytes' not in st.session_state:
@@ -429,13 +583,14 @@ if 'npz_path' not in st.session_state:
 if 'model_performance' not in st.session_state:
     st.session_state['model_performance'] = None
 
+# === Main execution ===
 if run_button:
     if not dicom_dir:
-        st.error('No DICOM input selected. Provide a local folder path or upload files.')
+        st.error('No DICOM input selected.')
     else:
         try:
             total_start_time = time.time()
-            
+
             with st.spinner('Reading DICOMs (robust mode)...'):
                 volumes_list, files, series_uid = read_dicom_series_robust(dicom_dir)
             st.write('Number of frames/series found:', len(volumes_list))
@@ -445,9 +600,24 @@ if run_button:
             if tvals is not None and np.all(np.isnan(tvals)):
                 tvals = None
             if tvals is None:
-                st.warning('Echo times not found in DICOM metadata; using uniform times 0.01-0.1s by default.')
+                st.warning('Time values not found in DICOM metadata; using uniform times 0.01-0.1s by default.')
                 tvals = np.linspace(0.01, 0.1, len(volumes_list))
             st.write('Echo/time samples (s):', np.array2string(tvals, precision=6))
+
+            # Field strength attempt
+            field_T = None
+            if pydicom is not None:
+                try:
+                    vals = []
+                    for f in files[:min(len(files), 20)]:
+                        ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+                        if hasattr(ds, 'MagneticFieldStrength') and ds.MagneticFieldStrength is not None:
+                            vals.append(float(ds.MagneticFieldStrength))
+                    if len(vals) > 0:
+                        field_T = float(np.median(vals))
+                except Exception:
+                    field_T = None
+            st.write('Detected Magnetic Field Strength (T):', field_T)
 
             mask = None
             if mask_path:
@@ -462,165 +632,155 @@ if run_button:
 
             S = compute_timeseries_from_volume_list(volumes_list, mask=mask)
             st.write('Measured S(t) length:', len(S))
-            
-            # Signal preprocessing
+
+            # preprocessing choices
             if normalize_signal:
                 S_original = S.copy()
                 S_min, S_max = np.min(S), np.max(S)
                 if S_max > S_min:
                     S = (S - S_min) / (S_max - S_min)
                 st.write('Signal normalized to range [0, 1]')
-            
+            else:
+                S_original = S.copy()
+
             if smooth_signal:
                 from scipy.ndimage import uniform_filter1d
                 S = uniform_filter1d(S, size=smooth_window)
                 st.write(f'Signal smoothed with window size {smooth_window}')
 
-            # Check if time values are reasonable
             if np.any(tvals <= 0):
                 st.error('Time values must be positive. Adjusting negative/zero values to 0.001s.')
                 tvals[tvals <= 0] = 0.001
 
-            # Check if signal shows any variation
-            if np.std(S) < 1e-10:
-                st.error('Signal has no variation. Check if the DICOM series contains different echo times.')
+            if np.std(S) < 1e-12:
+                st.error('Signal has no variation. Check the DICOM series.')
                 st.stop()
 
-            # Build appropriate grid based on model type
-            if model_type == 'T2-only':
-                T1_vals = np.array([1.0])  # Dummy value for T1
-                T2_vals = np.logspace(np.log10(T2_min), np.log10(T2_max), nT2)
-            elif model_type == 'T1-only':
-                T1_vals = np.logspace(np.log10(T1_min), np.log10(T1_max), nT1)
-                T2_vals = np.array([1.0])  # Dummy value for T2
+            # Auto-grid estimation (brain defaults)
+            def brain_default_ranges(field_T=None):
+                if field_T is None: field_T = 1.5
+                if field_T >= 3.0:
+                    return 0.2, 3.0, 0.02, 0.3
+                elif field_T >= 1.5:
+                    return 0.15, 2.5, 0.02, 0.25
+                else:
+                    return 0.12, 2.0, 0.01, 0.2
+
+            def_minT1, def_maxT1, def_minT2, def_maxT2 = brain_default_ranges(field_T)
+            est_T2, info_T2 = estimate_T2_multi_start(S, tvals)
+            est_T1, info_T1 = estimate_T1_multi_start(S, tvals)
+            if est_T2 is not None and np.isfinite(est_T2):
+                est_T2 = float(np.clip(est_T2, def_minT2, def_maxT2))
             else:
-                T1_vals, T2_vals = build_T1_T2_grid(T1_min, T1_max, nT1, T2_min, T2_max, nT2)
-                
+                est_T2 = (def_minT2 + def_maxT2) / 4.0
+            if est_T1 is not None and np.isfinite(est_T1):
+                est_T1 = float(np.clip(est_T1, def_minT1, def_maxT1))
+            else:
+                est_T1 = (def_minT1 + def_maxT1) / 3.0
+
+            used_T1_min = max(def_minT1, est_T1 / 5.0)
+            used_T1_max = min(def_maxT1, est_T1 * 5.0)
+            used_T2_min = max(def_minT2, est_T2 / 5.0)
+            used_T2_max = min(def_maxT2, est_T2 * 5.0)
+            st.write(f"Estimated T1 ≈ {est_T1:.4g} s  (bounds used: {used_T1_min:.4g}–{used_T1_max:.4g} s)")
+            st.write(f"Estimated T2 ≈ {est_T2:.4g} s  (bounds used: {used_T2_min:.4g}–{used_T2_max:.4g} s)")
+
+            # Build grid
+            if model_type == 'T2-only':
+                T1_vals = np.array([1.0])
+                T2_vals = np.logspace(np.log10(used_T2_min), np.log10(used_T2_max), nT2)
+            elif model_type == 'T1-only':
+                T1_vals = np.logspace(np.log10(used_T1_min), np.log10(used_T1_max), nT1)
+                T2_vals = np.array([1.0])
+            else:
+                T1_vals, T2_vals = build_T1_T2_grid(used_T1_min, used_T1_max, nT1, used_T2_min, used_T2_max, nT2)
+
             K, (T1_flat, T2_flat) = build_kernel_matrix(tvals, T1_vals, T2_vals, model_type)
             st.write('Kernel K shape:', K.shape)
-            
-            # Check kernel condition
-            try:
-                cond_num = np.linalg.cond(K)
-                st.write(f'Kernel condition number: {cond_num:.2e}')
-                if cond_num > 1e10:
-                    st.warning('Kernel is ill-conditioned. Results may be unstable.')
-            except:
-                st.warning('Could not compute kernel condition number.')
-            
-            # display min/max of T1 and T2 in both linear and log scales
+
+            # Display ranges: linear then log (log after T2 linear as requested)
             try:
                 st.write(f"T1 range (linear): {T1_vals.min():.6g} s — {T1_vals.max():.6g} s")
                 st.write(f"T2 range (linear): {T2_vals.min():.6g} s — {T2_vals.max():.6g} s")
-                st.write(f"T1 range (log10): {np.log10(T1_vals.min()):.6g} — {np.log10(T1_vals.max()):.6g}")
-                st.write(f"T2 range (log10): {np.log10(T2_vals.min()):.6g} — {np.log10(T2_vals.max()):.6g}")
+                if np.all(T2_vals > 0):
+                    st.write(f"T2 range (log10): {np.log10(T2_vals.min()):.6g} — {np.log10(T2_vals.max()):.6g}")
+                if np.all(T1_vals > 0):
+                    st.write(f"T1 range (log10): {np.log10(T1_vals.min()):.6g} — {np.log10(T1_vals.max()):.6g}")
             except Exception:
-                st.write(f"T1 range: {T1_vals[0]} ... {T1_vals[-1]}")
-                st.write(f"T2 range: {T2_vals[0]} ... {T2_vals[-1]}")
+                pass
 
+            # Quick solver path (with baseline & scaling for stability)
             progress_bar = st.progress(0)
             progress_text = st.empty()
 
-            def progress_callback(iter_no, x, rel):
-                pct = min(100, int(100.0 * iter_no / max_iters))
-                progress_bar.progress(pct)
-                progress_text.text(f'Iter {iter_no}  rel_change={rel:.3e}')
-
-            # Time the inversion process
-            inversion_start_time = time.time()
-            
-            if solver == 'lsq':
-                st.info('Using scipy.lsq_linear (non-negative least squares).')
-                res = lsq_linear(K, S, bounds=(0, np.inf), lsmr_tol='auto', max_iter=int(max_iters))
-                x_hat = res.x
-                info = {'method':'lsq_linear', 'status':res.status, 'cost':res.cost, 'nit':res.nit}
-            elif solver == 'nnls':
-                st.info('Using scipy.nnls (non-negative least squares).')
-                x_hat, residual = nnls(K, S)
-                info = {'method':'nnls', 'residual':residual}
+            baseline_est = float(np.median(S[-max(2, int(0.1 * len(S))):]))
+            S_bc = S - baseline_est
+            if normalize_signal:
+                S_work = S_bc.copy()
             else:
-                st.info('Running FISTA (non-negative)')
-                x_hat, info = fista_nonneg(K, S, lam=lam, max_iters=int(max_iters), tol=tol, callback=progress_callback, verbose=False)
-                info['method'] = 'fista_nonneg'
-            
-            # Calculate total inversion time
-            inversion_time = time.time() - inversion_start_time
-            info['total_time'] = inversion_time
+                scale_val = np.max(np.abs(S_bc)) if np.max(np.abs(S_bc)) > 0 else 1.0
+                S_work = S_bc / scale_val
 
-            # Reshape solution based on model type
+            K_work = K.astype(float).copy()
+            col_norms = np.linalg.norm(K_work, axis=0)
+            col_norms_safe = np.where(col_norms == 0, 1.0, col_norms)
+            K_work = K_work / col_norms_safe
+
+            inversion_start_time = time.time()
+            if solver == 'lsq':
+                res = lsq_linear(K_work, S_work, bounds=(0, np.inf), lsmr_tol='auto', max_iter=int(max_iters))
+                x_work = res.x
+                back_scale = 1.0 if normalize_signal else scale_val
+                x_hat = (x_work / col_norms_safe) * back_scale
+                info = {'method': 'lsq_linear', 'nit': res.nit, 'status': res.status}
+            elif solver == 'nnls':
+                xw, residual = nnls(K_work, S_work)
+                back_scale = 1.0 if normalize_signal else scale_val
+                x_hat = (xw / col_norms_safe) * back_scale
+                info = {'method': 'nnls', 'residual': residual}
+            else:
+                svals = np.linalg.svd(K_work, compute_uv=False)
+                L_est = float(svals[0]**2) if svals.size > 0 else 1.0
+                lam_scaled = float(lam) * L_est if lam > 0 else 1e-4 * L_est
+                xw, info_f = fista_nonneg(K_work, S_work, lam=lam_scaled, max_iters=int(max_iters), tol=tol, callback=None, verbose=False)
+                back_scale = 1.0 if normalize_signal else scale_val
+                x_hat = (xw / col_norms_safe) * back_scale
+                info = info_f
+                info.update({'method': 'fista_nonneg', 'lam_scaled': lam_scaled})
+
+            inversion_time = time.time() - inversion_start_time
+            info['inversion_time'] = inversion_time
+
+            # reshape recovered distribution
             if model_type == 'T2-only':
                 f_recovered = x_hat.reshape(len(T2_vals), 1)
             elif model_type == 'T1-only':
                 f_recovered = x_hat.reshape(1, len(T1_vals))
             else:
                 f_recovered = x_hat.reshape(len(T2_vals), len(T1_vals))
-                
-            info['shape'] = f_recovered.shape
 
-            # Calculate model performance metrics
+            # Predict and compute metrics
             S_pred = K @ x_hat
             performance = calculate_performance_metrics(S, S_pred, tvals, x_hat, inversion_time)
             st.session_state['model_performance'] = performance
+            performance['total_processing_time'] = time.time() - total_start_time
 
-            # Calculate total processing time
-            total_time = time.time() - total_start_time
-            performance['total_processing_time'] = total_time
-
+            # Save results to npz
             out_npz = os.path.join(tempfile.gettempdir(), f'recovered_{int(time.time())}.npz')
-            np.savez(out_npz, T1_values=T1_vals, T2_values=T2_vals, f_recovered=f_recovered, 
+            np.savez(out_npz, T1_values=T1_vals, T2_values=T2_vals, f_recovered=f_recovered,
                      f_vector=x_hat, S=S, S_pred=S_pred, t_values=tvals, info=info, performance=performance)
             st.session_state['npz_path'] = out_npz
-            st.success('Inversion complete.')
 
-            # Display model performance
+            # Display metrics + plots
             st.subheader('Model Performance')
-            
-            # Main metrics
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("MSE", f"{performance['mse']:.4e}")
-            col2.metric("RMSE", f"{performance['rmse']:.4e}")
-            col3.metric("MAE", f"{performance['mae']:.4e}")
-            col4.metric("R²", f"{performance['r2']:.4f}")
-            col5.metric("Explained Variance", f"{performance['explained_variance']:.4f}")
-            
-            # Additional metrics
-            col6, col7, col8, col9, col10 = st.columns(5)
-            col6.metric("NRMSE (range)", f"{performance['nrmse_range']:.4f}")
-            col7.metric("NRMSE (mean)", f"{performance['nrmse_mean']:.4f}")
-            col8.metric("SNR (dB)", f"{performance['snr_db']:.2f}")
-            col9.metric("Inversion Time", f"{performance['inversion_time']:.2f} s")
-            col10.metric("Total Time", f"{performance['total_processing_time']:.2f} s")
-            
-            # Display diagnostic information
-            with st.expander("Diagnostic Information"):
-                st.write(f"Signal range: {performance['signal_range']:.4e}")
-                st.write(f"Signal mean: {performance['signal_mean']:.4e}")
-                st.write(f"Signal std: {performance['signal_std']:.4e}")
-                st.write(f"Residual std: {performance['residual_std']:.4e}")
-                st.write(f"Condition ratio: {performance['condition_ratio']:.4e}")
-                
-                if performance['r2'] < 0:
-                    st.warning("""
-                    **Poor Model Fit Detected (R² < 0)**
-                    
-                    This indicates the model is performing worse than simply predicting the mean.
-                    Possible reasons:
-                    1. The kernel model may not match the physical process
-                    2. The time points may not be appropriate for T1/T2 estimation
-                    3. The regularization parameter may need adjustment
-                    4. The signal may be too noisy for reliable inversion
-                    
-                    **Suggestions:**
-                    - Try different model types (T1-only, T2-only)
-                    - Adjust the regularization parameter
-                    - Check if the echo times are correctly extracted
-                    - Verify the signal shows expected decay behavior
-                    """)
+            cols = st.columns(5)
+            cols[0].metric("MSE", f"{performance['mse']:.4e}")
+            cols[1].metric("RMSE", f"{performance['rmse']:.4e}")
+            cols[2].metric("MAE", f"{performance['mae']:.4e}")
+            cols[3].metric("R²", f"{performance['r2']:.4f}")
+            cols[4].metric("Explained Var", f"{performance['explained_variance']:.4f}")
 
-            # Create comprehensive visualization
             fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-            
-            # Plot 1: Measured vs Predicted Signal
             axes[0, 0].plot(tvals, S, 'o-', label='Measured', linewidth=2, markersize=6)
             axes[0, 0].plot(tvals, S_pred, 's--', label='Predicted', linewidth=2, markersize=4)
             axes[0, 0].set_xlabel('Time (s)')
@@ -628,59 +788,64 @@ if run_button:
             axes[0, 0].set_title('Measured vs Predicted Signal')
             axes[0, 0].legend()
             axes[0, 0].grid(True, alpha=0.3)
-            
-            # Plot 2: Residuals
+
             residuals = S - S_pred
-            axes[0, 1].plot(tvals, residuals, 'o-', color='red', linewidth=2, markersize=6)
+            axes[0, 1].plot(tvals, residuals, 'o-', linewidth=2, markersize=6)
             axes[0, 1].axhline(y=0, color='k', linestyle='--', alpha=0.7)
             axes[0, 1].set_xlabel('Time (s)')
             axes[0, 1].set_ylabel('Residuals')
             axes[0, 1].set_title('Residuals (Measured - Predicted)')
             axes[0, 1].grid(True, alpha=0.3)
-            
-            # Plot 3: Recovered distribution
+
             if model_type == 'T2-only':
                 axes[0, 2].plot(T2_vals, f_recovered.flatten(), 'o-', linewidth=2)
                 axes[0, 2].set_xlabel('T2 (s)')
-                axes[0, 2].set_ylabel('f(T2)')
-                axes[0, 2].set_title('Recovered T2 Distribution')
                 axes[0, 2].set_xscale('log')
+                axes[0, 2].set_title('Recovered T2 Distribution')
             elif model_type == 'T1-only':
                 axes[0, 2].plot(T1_vals, f_recovered.flatten(), 'o-', linewidth=2)
                 axes[0, 2].set_xlabel('T1 (s)')
-                axes[0, 2].set_ylabel('f(T1)')
-                axes[0, 2].set_title('Recovered T1 Distribution')
                 axes[0, 2].set_xscale('log')
+                axes[0, 2].set_title('Recovered T1 Distribution')
             else:
                 im = axes[0, 2].imshow(np.log10(f_recovered + 1e-12), aspect='auto',
-                                      extent=(np.log10(T1_vals[0]), np.log10(T1_vals[-1]), 
+                                      extent=(np.log10(T1_vals[0]), np.log10(T1_vals[-1]),
                                               np.log10(T2_vals[-1]), np.log10(T2_vals[0])))
                 axes[0, 2].set_xlabel('log10($T_{1}$)')
                 axes[0, 2].set_ylabel('log10($T_{2}$)')
                 axes[0, 2].set_title('Recovered log10 f($T_{1}$,$T_{2}$)')
                 fig.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04)
-            
-            # Plot 4: Signal distribution
-            axes[1, 0].hist(S, bins=20, alpha=0.7, color='blue')
+
+            axes[1, 0].hist(S, bins=20, alpha=0.7)
             axes[1, 0].set_xlabel('Signal Intensity')
-            axes[1, 0].set_ylabel('Frequency')
             axes[1, 0].set_title('Signal Distribution')
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # Plot 5: Residual distribution
-            axes[1, 1].hist(residuals, bins=20, alpha=0.7, color='red')
+
+            axes[1, 1].hist(residuals, bins=20, alpha=0.7)
             axes[1, 1].set_xlabel('Residual Value')
-            axes[1, 1].set_ylabel('Frequency')
             axes[1, 1].set_title('Residual Distribution')
-            axes[1, 1].grid(True, alpha=0.3)
-            
-            # Plot 6: QQ plot of residuals
+
             (osm, osr), (slope, intercept, r) = stats.probplot(residuals, dist="norm", plot=axes[1, 2])
             axes[1, 2].set_title('Q-Q Plot of Residuals')
-            
+
             plt.tight_layout()
             st.pyplot(fig)
 
+            # decorative gallery under plots if enabled
+            if show_images:
+                try:
+                    if LOCAL_DECOR_PATHS:
+                        imgs = [p for p in LOCAL_DECOR_PATHS if os.path.exists(p)]
+                        if imgs:
+                            st.image(imgs, width=300)
+                    else:
+                        st.image(DECOR_IMAGES, width=300, caption=["MRI scanner", "Colorful MRI", "Patient in MRI"])
+                except Exception:
+                    placeholders = [make_placeholder_image("MRI 1", 300, 200),
+                                    make_placeholder_image("MRI 2", 300, 200),
+                                    make_placeholder_image("MRI 3", 300, 200)]
+                    st.image(placeholders, width=300)
+
+            # Prepare downloads
             try:
                 csv_grid = prepare_csv_bytes(T1_vals, T2_vals, f_recovered, S, tvals)
                 csv_st = prepare_st_series_csv_bytes(tvals, S)
@@ -701,6 +866,7 @@ if run_button:
                 except Exception:
                     pass
 
+# Downloads / Exports UI
 st.markdown('---')
 st.header('Downloads / Exports (available after successful inversion)')
 
@@ -728,7 +894,6 @@ st.sidebar.write('Diagnostics:')
 st.sidebar.write('pydicom installed:', bool(pydicom))
 st.sidebar.write('CSV prepared in session:', st.session_state.get('csv_grid_bytes') is not None)
 
-# Display performance metrics in sidebar if available
 if st.session_state.get('model_performance'):
     st.sidebar.markdown('---')
     st.sidebar.subheader('Last Run Performance')
@@ -737,12 +902,3 @@ if st.session_state.get('model_performance'):
     st.sidebar.write(f"RMSE: {perf['rmse']:.4e}")
     st.sidebar.write(f"MAE: {perf['mae']:.4e}")
     st.sidebar.write(f"Time: {perf['total_processing_time']:.2f} s")
-    
-    if perf['r2'] < 0:
-        st.sidebar.warning('Poor fit (R² < 0)')
-    elif perf['r2'] < 0.5:
-        st.sidebar.warning('Moderate fit (R² < 0.5)')
-    elif perf['r2'] < 0.8:
-        st.sidebar.info('Good fit (R² < 0.8)')
-    else:
-        st.sidebar.success('Excellent fit (R² ≥ 0.8)')
